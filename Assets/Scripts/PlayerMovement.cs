@@ -7,15 +7,26 @@ using UnityEditor;
 
 public class PlayerMovement : MonoBehaviour
 {
-    public float moveSpeed = 5f;
+    [Header("Movement")]
+    public float walkSpeed = 2.5f;
+    public float runSpeed = 5f;
     public float rotationSpeed = 10f;
+
+    [Header("Stamina")]
+    public float maxStamina = 100f;
+    public float staminaRegenRate = 25f;
+    public float staminaRegenDelay = 1.5f;
+    public float lightAttackCost = 15f;
+    public float heavyAttackCost = 35f;
 
     [Header("Animation")]
     [SerializeField] private Animator animator;
     [SerializeField] private bool startsArmed = true;
     [SerializeField] private float animationFadeTime = 0.15f;
     [SerializeField] private float jumpLockTime = 0.75f;
-    [SerializeField] private float attackLockTime = 0.8f;
+    [SerializeField] private float lightAttackLockTime = 0.55f;
+    [SerializeField] private float heavyAttackLockTime = 1.1f;
+    [SerializeField] private float comboWindowDuration = 0.65f;
     [SerializeField] private float equipLockTime = 1f;
     [SerializeField] private float tauntLockTime = 1.4f;
     [SerializeField] private float hitLockTime = 0.8f;
@@ -32,7 +43,6 @@ public class PlayerMovement : MonoBehaviour
     [SerializeField] private string standingRunStateName = "standing run forward";
     [SerializeField] private string standingWalkStateName = "standing walk forward";
     [SerializeField] private string standingJumpStateName = "standing jump";
-    [SerializeField] private string standingBlockStateName = "standing block idle";
     [SerializeField] private string crouchStateName = "crouch idle";
     [SerializeField] private string crouchToStandStateName = "crouch to standing idle";
 
@@ -53,19 +63,18 @@ public class PlayerMovement : MonoBehaviour
         "unarmed idle looking ver. 1",
         "unarmed idle looking ver. 2"
     };
-    [SerializeField] private string[] standingAttackStateNames =
+    // 3-hit light combo played in order
+    [SerializeField] private string[] lightComboStateNames =
     {
         "standing melee attack horizontal",
         "standing melee attack downward",
-        "standing melee attack backhand",
+        "standing melee attack backhand"
+    };
+    // Heavy attack — cycles between variants
+    [SerializeField] private string[] heavyAttackStateNames =
+    {
         "standing melee attack 360 high",
-        "standing melee attack 360 low",
-        "standing melee attack kick ver. 1",
-        "standing melee attack kick ver. 2",
-        "standing melee combo attack ver. 1",
-        "standing melee combo attack ver. 2",
-        "standing melee combo attack ver. 3",
-        "standing melee run jump attack"
+        "standing melee attack 360 low"
     };
     [SerializeField] private string[] tauntStateNames =
     {
@@ -90,6 +99,13 @@ public class PlayerMovement : MonoBehaviour
         "standing disarm underarm"
     };
 
+    // Exposed for UI
+    public float CurrentStamina => currentStamina;
+    public float MaxStamina     => maxStamina;
+    public int   ComboStep      => comboStep;
+    public int   ComboMaxSteps  => lightComboStateNames.Length;
+    public float ComboWindowEnd => comboWindowEnd;
+
     private CharacterController controller;
     private PlayerControls controls;
     private Transform movementRoot;
@@ -97,7 +113,7 @@ public class PlayerMovement : MonoBehaviour
     private bool isArmed;
     private bool wasCrouching;
     private float animationLockedUntil;
-    private int nextAttackIndex;
+    private int nextHeavyAttackIndex;
     private int nextTauntIndex;
     private int nextHitIndex;
     private int nextEquipIndex;
@@ -108,11 +124,19 @@ public class PlayerMovement : MonoBehaviour
     private float locomotionDistance;
     private int currentDistanceMatchedStateHash;
 
+    // Stamina
+    private float currentStamina;
+    private float lastStaminaDrainTime;
+
+    // Combo
+    private int comboStep;          // 0-2, which hit comes next
+    private float comboWindowEnd;   // deadline for next queued hit to fire
+    private bool comboPending;      // LMB pressed during lock — fire when lock ends
+
     private AnimationState standingIdleState;
     private AnimationState standingRunState;
     private AnimationState standingWalkState;
     private AnimationState standingJumpState;
-    private AnimationState standingBlockState;
     private AnimationState crouchState;
     private AnimationState crouchToStandState;
     private AnimationState unarmedIdleState;
@@ -121,7 +145,8 @@ public class PlayerMovement : MonoBehaviour
     private AnimationState unarmedJumpState;
     private AnimationState[] standingIdleVariantStates;
     private AnimationState[] unarmedIdleVariantStates;
-    private AnimationState[] standingAttackStates;
+    private AnimationState[] lightComboStates;
+    private AnimationState[] heavyAttackStates;
     private AnimationState[] tauntStates;
     private AnimationState[] hitStates;
     private AnimationState[] equipStates;
@@ -141,6 +166,7 @@ public class PlayerMovement : MonoBehaviour
             ? animator
             : movementRoot.GetComponentInChildren<Animator>() ?? GetComponentInChildren<Animator>() ?? GetComponentInParent<Animator>();
         isArmed = startsArmed;
+        currentStamina = maxStamina;
 
         if (animator != null)
         {
@@ -173,15 +199,15 @@ public class PlayerMovement : MonoBehaviour
 
     private void Update()
     {
-        Vector3 move = new Vector3(moveInput.x, 0f, moveInput.y);
+        bool isWalking = Keyboard.current != null && Keyboard.current.leftShiftKey.isPressed;
+        float speed = isWalking ? walkSpeed : runSpeed;
 
+        Vector3 move = new Vector3(moveInput.x, 0f, moveInput.y);
         Quaternion isoRotation = Quaternion.Euler(0f, 45f, 0f);
         move = isoRotation * move;
 
         if (move.sqrMagnitude > 1f)
-        {
             move.Normalize();
-        }
 
         if (move != Vector3.zero)
         {
@@ -196,20 +222,17 @@ public class PlayerMovement : MonoBehaviour
         Vector3 positionBeforeMove = movementRoot.position;
 
         if (controller != null)
-        {
-            controller.Move(move * moveSpeed * Time.deltaTime);
-        }
+            controller.Move(move * speed * Time.deltaTime);
         else
-        {
-            movementRoot.position += move * moveSpeed * Time.deltaTime;
-        }
+            movementRoot.position += move * speed * Time.deltaTime;
 
         float distanceMoved = Vector3.ProjectOnPlane(
             movementRoot.position - positionBeforeMove,
             Vector3.up
         ).magnitude;
 
-        UpdateAnimation(move.sqrMagnitude > 0.0001f, distanceMoved);
+        RegenStamina();
+        UpdateAnimation(move.sqrMagnitude > 0.0001f, distanceMoved, isWalking);
     }
 
     public void SetAnimator(Animator newAnimator)
@@ -217,9 +240,7 @@ public class PlayerMovement : MonoBehaviour
         animator = newAnimator;
 
         if (animator != null)
-        {
             animator.applyRootMotion = false;
-        }
 
         CacheAnimatorStates();
     }
@@ -229,13 +250,73 @@ public class PlayerMovement : MonoBehaviour
         PlayNextLockedState(hitStates, ref nextHitIndex, hitLockTime);
     }
 
+    // -------------------------------------------------------
+    // Stamina
+    // -------------------------------------------------------
+
+    private void RegenStamina()
+    {
+        if (Time.time - lastStaminaDrainTime >= staminaRegenDelay)
+            currentStamina = Mathf.Min(maxStamina, currentStamina + staminaRegenRate * Time.deltaTime);
+    }
+
+    private void DrainStamina(float amount)
+    {
+        currentStamina = Mathf.Max(0f, currentStamina - amount);
+        lastStaminaDrainTime = Time.time;
+    }
+
+    // -------------------------------------------------------
+    // Attack helpers
+    // -------------------------------------------------------
+
+    private bool TryLightAttack()
+    {
+        if (currentStamina < lightAttackCost)
+            return false;
+
+        if (lightComboStates == null || lightComboStates.Length == 0)
+            return false;
+
+        AnimationState state = lightComboStates[comboStep % lightComboStates.Length];
+        if (!state.Exists)
+            return false;
+
+        DrainStamina(lightAttackCost);
+        PlayLockedState(state, lightAttackLockTime);
+        // Next hit can be queued until the lock ends + window
+        comboWindowEnd = animationLockedUntil + comboWindowDuration;
+        comboStep = (comboStep + 1) % lightComboStates.Length;
+        return true;
+    }
+
+    private bool TryHeavyAttack()
+    {
+        if (currentStamina < heavyAttackCost)
+            return false;
+
+        bool played = PlayNextLockedState(heavyAttackStates, ref nextHeavyAttackIndex, heavyAttackLockTime);
+        if (!played)
+            return false;
+
+        DrainStamina(heavyAttackCost);
+        // Heavy attack resets the light combo
+        comboStep = 0;
+        comboWindowEnd = 0f;
+        comboPending = false;
+        return true;
+    }
+
+    // -------------------------------------------------------
+    // Animation
+    // -------------------------------------------------------
+
     private void CacheAnimatorStates()
     {
         standingIdleState = MakeState(standingIdleStateName);
         standingRunState = MakeState(standingRunStateName);
         standingWalkState = MakeState(standingWalkStateName);
         standingJumpState = MakeState(standingJumpStateName);
-        standingBlockState = MakeState(standingBlockStateName);
         crouchState = MakeState(crouchStateName);
         crouchToStandState = MakeState(crouchToStandStateName);
         unarmedIdleState = MakeState(unarmedIdleStateName);
@@ -244,7 +325,8 @@ public class PlayerMovement : MonoBehaviour
         unarmedJumpState = MakeState(unarmedJumpStateName);
         standingIdleVariantStates = MakeStates(standingIdleVariantStateNames);
         unarmedIdleVariantStates = MakeStates(unarmedIdleVariantStateNames);
-        standingAttackStates = MakeStates(standingAttackStateNames);
+        lightComboStates = MakeStates(lightComboStateNames);
+        heavyAttackStates = MakeStates(heavyAttackStateNames);
         tauntStates = MakeStates(tauntStateNames);
         hitStates = MakeStates(hitStateNames);
         equipStates = MakeStates(equipStateNames);
@@ -254,41 +336,31 @@ public class PlayerMovement : MonoBehaviour
     private AnimationState MakeState(string stateName)
     {
         if (animator == null || animator.runtimeAnimatorController == null)
-        {
             return default;
-        }
 
         int hash = Animator.StringToHash($"Base Layer.{SanitizeStateName(stateName)}");
-
-        return new AnimationState
-        {
-            Hash = hash,
-            Exists = animator.HasState(0, hash)
-        };
+        return new AnimationState { Hash = hash, Exists = animator.HasState(0, hash) };
     }
 
     private AnimationState[] MakeStates(string[] stateNames)
     {
         AnimationState[] states = new AnimationState[stateNames.Length];
-
         for (int i = 0; i < stateNames.Length; i++)
-        {
             states[i] = MakeState(stateNames[i]);
-        }
-
         return states;
     }
 
-    private void UpdateAnimation(bool isMoving, float distanceMoved)
+    private void UpdateAnimation(bool isMoving, float distanceMoved, bool isWalking)
     {
         if (animator == null || animator.runtimeAnimatorController == null)
-        {
             return;
-        }
 
         bool crouchHeld = Keyboard.current != null &&
             (Keyboard.current.leftCtrlKey.isPressed || Keyboard.current.cKey.isPressed);
-        bool blockHeld = Mouse.current != null && Mouse.current.rightButton.isPressed;
+
+        // Reset combo if the window expired and no input was queued
+        if (comboStep > 0 && !comboPending && Time.time > comboWindowEnd)
+            comboStep = 0;
 
         if (Keyboard.current != null)
         {
@@ -312,23 +384,53 @@ public class PlayerMovement : MonoBehaviour
             }
         }
 
-        if (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame &&
-            PlayNextLockedState(standingAttackStates, ref nextAttackIndex, attackLockTime))
+        if (Mouse.current != null)
         {
-            ResetIdleVariantTimer();
-            return;
+            // PPM — heavy attack (not during lock)
+            if (Mouse.current.rightButton.wasPressedThisFrame && Time.time >= animationLockedUntil)
+            {
+                if (TryHeavyAttack())
+                {
+                    ResetIdleVariantTimer();
+                    return;
+                }
+            }
+
+            // LPM — light combo
+            if (Mouse.current.leftButton.wasPressedThisFrame)
+            {
+                if (Time.time < animationLockedUntil)
+                {
+                    // Accept input during lock as long as we are inside the combo window
+                    if (Time.time <= comboWindowEnd)
+                        comboPending = true;
+                }
+                else
+                {
+                    if (TryLightAttack())
+                    {
+                        ResetIdleVariantTimer();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Fire the queued combo step as soon as the lock lifts
+        if (comboPending && Time.time >= animationLockedUntil)
+        {
+            comboPending = false;
+            if (Time.time <= comboWindowEnd && TryLightAttack())
+            {
+                ResetIdleVariantTimer();
+                return;
+            }
+            // Missed the window — reset combo
+            comboStep = 0;
         }
 
         if (Time.time < animationLockedUntil)
-        {
             return;
-        }
-
-        if (blockHeld && isArmed && PlayState(standingBlockState))
-        {
-            ResetIdleVariantTimer();
-            return;
-        }
 
         if (crouchHeld && PlayState(crouchState))
         {
@@ -340,16 +442,12 @@ public class PlayerMovement : MonoBehaviour
         if (wasCrouching)
         {
             wasCrouching = false;
-
             if (PlayLockedState(crouchToStandState, jumpLockTime))
-            {
                 return;
-            }
         }
 
         if (isMoving)
         {
-            bool isWalking = Keyboard.current != null && Keyboard.current.leftShiftKey.isPressed;
             bool playedLocomotion = PlayLocomotionState(
                 isWalking ? GetWalkState() : GetRunState(),
                 distanceMoved,
@@ -357,9 +455,7 @@ public class PlayerMovement : MonoBehaviour
             );
 
             if (!playedLocomotion)
-            {
                 PlayState(GetIdleState());
-            }
 
             ResetIdleVariantTimer();
             return;
@@ -380,59 +476,39 @@ public class PlayerMovement : MonoBehaviour
         isArmed = !isArmed;
 
         if (wasArmed)
-        {
             return PlayNextLockedState(disarmStates, ref nextDisarmIndex, equipLockTime);
-        }
 
         return PlayNextLockedState(equipStates, ref nextEquipIndex, equipLockTime);
     }
 
     private AnimationState GetIdleState()
     {
-        if (!isArmed && unarmedIdleState.Exists)
-        {
-            return unarmedIdleState;
-        }
-
+        if (!isArmed && unarmedIdleState.Exists) return unarmedIdleState;
         return standingIdleState;
     }
 
     private AnimationState GetRunState()
     {
-        if (!isArmed && unarmedRunState.Exists)
-        {
-            return unarmedRunState;
-        }
-
+        if (!isArmed && unarmedRunState.Exists) return unarmedRunState;
         return standingRunState;
     }
 
     private AnimationState GetWalkState()
     {
-        if (!isArmed && unarmedWalkState.Exists)
-        {
-            return unarmedWalkState;
-        }
-
+        if (!isArmed && unarmedWalkState.Exists) return unarmedWalkState;
         return standingWalkState;
     }
 
     private AnimationState GetJumpState()
     {
-        if (!isArmed && unarmedJumpState.Exists)
-        {
-            return unarmedJumpState;
-        }
-
+        if (!isArmed && unarmedJumpState.Exists) return unarmedJumpState;
         return standingJumpState;
     }
 
     private bool PlayNextIdleVariant()
     {
         if (!isArmed && PlayNextLockedState(unarmedIdleVariantStates, ref nextUnarmedIdleVariantIndex, idleVariantLockTime))
-        {
             return true;
-        }
 
         return PlayNextLockedState(standingIdleVariantStates, ref nextStandingIdleVariantIndex, idleVariantLockTime);
     }
@@ -449,9 +525,7 @@ public class PlayerMovement : MonoBehaviour
             int index = (nextIndex + i) % states.Length;
 
             if (!states[index].Exists)
-            {
                 continue;
-            }
 
             nextIndex = (index + 1) % states.Length;
             return PlayLockedState(states[index], lockTime);
@@ -463,9 +537,7 @@ public class PlayerMovement : MonoBehaviour
     private bool PlayLockedState(AnimationState state, float lockTime)
     {
         if (!PlayState(state, true))
-        {
             return false;
-        }
 
         animationLockedUntil = Time.time + lockTime;
         return true;
@@ -484,9 +556,7 @@ public class PlayerMovement : MonoBehaviour
         currentDistanceMatchedStateHash = 0;
 
         if (forceRestart || animator.GetCurrentAnimatorStateInfo(0).fullPathHash != state.Hash)
-        {
             animator.CrossFade(state.Hash, animationFadeTime, 0);
-        }
 
         return true;
     }
@@ -494,9 +564,7 @@ public class PlayerMovement : MonoBehaviour
     private bool PlayLocomotionState(AnimationState state, float distanceMoved, float cycleDistance)
     {
         if (!state.Exists)
-        {
             return false;
-        }
 
         if (!distanceMatchLocomotion)
         {
@@ -505,9 +573,7 @@ public class PlayerMovement : MonoBehaviour
         }
 
         if (currentDistanceMatchedStateHash != state.Hash)
-        {
             currentDistanceMatchedStateHash = state.Hash;
-        }
 
         locomotionDistance += distanceMoved;
 
@@ -524,19 +590,15 @@ public class PlayerMovement : MonoBehaviour
     {
 #if UNITY_EDITOR
         if (animator.runtimeAnimatorController != null)
-        {
             return;
-        }
 
-        RuntimeAnimatorController controller =
+        RuntimeAnimatorController ctrl =
             AssetDatabase.LoadAssetAtPath<RuntimeAnimatorController>("Assets/Animations/PlayerAuto.controller");
 
-        if (controller == null)
-        {
+        if (ctrl == null)
             return;
-        }
 
-        animator.runtimeAnimatorController = controller;
+        animator.runtimeAnimatorController = ctrl;
         EditorUtility.SetDirty(animator);
 #endif
     }
