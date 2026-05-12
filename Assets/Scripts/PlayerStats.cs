@@ -13,9 +13,8 @@ public class PlayerStats : MonoBehaviour
     [Range(0f, 100f)] public float corruption = 42f;
 
     [Header("Progression")]
-    public int   leyer          = 18;
-    public float pd             = 127f;
-    public float pdToNextLeyer  = 220f;
+    public int   leyer = 18;
+    public float pd    = 127f;
 
     [Header("Combat Stats")]
     public float damage  = 187f;
